@@ -1,0 +1,1 @@
+self.addEventListener('install',e=>e.waitUntil(caches.open('charu-v1').then(c=>c.addAll(['/','/static/logo.png','/manifest.json']))));self.addEventListener('fetch',e=>{if(e.request.method==='GET'&&!e.request.url.includes('/api/'))e.respondWith(fetch(e.request).catch(()=>caches.match(e.request)))});
