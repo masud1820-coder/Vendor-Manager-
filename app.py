@@ -11,6 +11,7 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 app = Flask(__name__, static_folder='static', static_url_path='/static')
 SECRET = os.environ.get('SECRET_KEY', '')
 DATABASE_URL = os.environ.get('DATABASE_URL', '')
+ADMIN_SETUP_TOKEN = os.environ.get('ADMIN_SETUP_TOKEN', '')
 if len(SECRET) < 32 or not DATABASE_URL:
     raise RuntimeError('Set DATABASE_URL and a random SECRET_KEY of at least 32 characters in Render environment variables')
 app.secret_key = SECRET
@@ -107,6 +108,10 @@ def register():
             # Serializes the first-admin election even when requests arrive together.
             conn.execute('SELECT pg_advisory_xact_lock(473813)')
             first=conn.execute('SELECT NOT EXISTS(SELECT 1 FROM users) AS first').fetchone()['first']
+            if first:
+                submitted_token = str(d.get('admin_token', ''))
+                if len(ADMIN_SETUP_TOKEN) < 32 or not secrets.compare_digest(submitted_token, ADMIN_SETUP_TOKEN):
+                    return jsonify(error='First admin setup token is missing or incorrect'), 403
             conn.execute('INSERT INTO users(name,username,password,role,approved) VALUES(%s,%s,%s,%s,%s)',
                          (name,username,generate_password_hash(pw),'admin' if first else 'user',1 if first else 0))
     except UniqueViolation:
@@ -164,9 +169,8 @@ def save(kind):
             if not (2000<=vals[1]<=2200 and 1<=vals[2]<=12 and math.isfinite(vals[3]) and vals[3]>=0):raise ValueError()
         except (TypeError,ValueError):return jsonify(error='Invalid payment values'),400
     if kind in ('banks','heads','vendors') and not str(vals[0]).strip():return jsonify(error='Name required'),400
-    if kind=='settings' and str(vals[0]) not in ('institution','address','org_name','org_address'):
-        # Accept known UI setting keys after reviewing frontend; avoid arbitrary stored keys.
-        pass
+    if kind=='settings' and str(vals[0]) not in ('organization','address'):
+        return jsonify(error='Invalid setting key'),400
     if any(isinstance(v,str) and len(v)>2000 for v in vals):return jsonify(error='Field too long'),400
     try:
         with db() as conn:
