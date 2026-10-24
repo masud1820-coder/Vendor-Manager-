@@ -13,7 +13,7 @@ SECRET = os.environ.get('SECRET_KEY', '')
 DATABASE_URL = os.environ.get('DATABASE_URL', '')
 ADMIN_SETUP_TOKEN = os.environ.get('ADMIN_SETUP_TOKEN', '')
 if len(SECRET) < 6 or not DATABASE_URL:
-    raise RuntimeError('Set DATABASE_URL and a SECRET_KEY of at least 6 characters in Render environment variables')
+    raise RuntimeError('Set DATABASE_URL and SECRET_KEY in Render environment variables')
 app.secret_key = SECRET
 app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE='Lax',
                   SESSION_COOKIE_SECURE=True, PERMANENT_SESSION_LIFETIME=timedelta(hours=8),
@@ -40,27 +40,26 @@ def init():
         conn.execute('''CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT)''')
         conn.execute('''CREATE TABLE IF NOT EXISTS login_attempts(username TEXT PRIMARY KEY, attempts INTEGER NOT NULL DEFAULT 0, blocked_until DOUBLE PRECISION NOT NULL DEFAULT 0)''')
         conn.execute("INSERT INTO heads(name) VALUES('General') ON CONFLICT DO NOTHING")
-        # Advisory lock ensures seed data is inserted only once across concurrent workers.
         conn.execute('SELECT pg_advisory_xact_lock(473812)')
         if conn.execute('SELECT COUNT(*) AS n FROM vendors').fetchone()['n'] == 0:
-            seed_path = os.path.join(BASE, 'seed.json')
-            if os.path.exists(seed_path):
-                with open(seed_path, encoding='utf-8') as f: seed = json.load(f)
+            path = os.path.join(BASE, 'seed.json')
+            if os.path.exists(path):
+                with open(path, encoding='utf-8') as f:
+                    seed = json.load(f)
                 mapping = {}
+                keys = ('name','holder','account','routing','branch','bank','mobile','head')
                 for v in seed.get('vendors', []):
-                    keys = ('name','holder','account','routing','branch','bank','mobile','head')
-                    rec = conn.execute('INSERT INTO vendors(name,holder,account,routing,branch,bank,mobile,head) VALUES(%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id', tuple(v.get(k,'') for k in keys)).fetchone()
-                    mapping[str(v.get('account',''))+'|'+str(v.get('holder',''))] = rec['id']
+                    row = conn.execute('INSERT INTO vendors(name,holder,account,routing,branch,bank,mobile,head) VALUES(%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id', tuple(v.get(k,'') for k in keys)).fetchone()
+                    mapping[str(v.get('account',''))+'|'+str(v.get('holder',''))] = row['id']
                 for p in seed.get('payments', []):
                     if p.get('key') in mapping:
                         conn.execute('INSERT INTO payments(vendor_id,year,month,amount,head) VALUES(%s,%s,%s,%s,%s)', (mapping[p['key']],p['year'],p['month'],p['amount'],p.get('head','')))
-                for b in seed.get('banks', []):
-                    conn.execute('INSERT INTO banks(name) VALUES(%s) ON CONFLICT DO NOTHING',(b,))
+                for bank in seed.get('banks', []):
+                    conn.execute('INSERT INTO banks(name) VALUES(%s) ON CONFLICT DO NOTHING', (bank,))
 
 @app.before_request
 def protect_writes():
     if request.method in ('POST','PUT','PATCH','DELETE'):
-        # Reject cross-site form and fetch requests (Origin is sent by modern browsers).
         origin = request.headers.get('Origin')
         if origin and origin.rstrip('/') != request.host_url.rstrip('/'):
             return jsonify(error='Invalid request origin'), 403
@@ -76,133 +75,162 @@ def security_headers(response):
     return response
 
 def auth(fn):
-    @wraps(fn)
-    def inner(*a,**kw):
-        if not session.get('uid'): return jsonify(error='Login required'),401
-        user = query('SELECT id,name,role,approved FROM users WHERE id=%s',(session['uid'],))
+@wraps(fn)
+    def inner(*args, **kwargs):
+        if not session.get('uid'):
+            return jsonify(error='Login required'), 401
+        user = query('SELECT id,name,role,approved FROM users WHERE id=%s', (session['uid'],))
         if not user or not user[0]['approved']:
-            session.clear(); return jsonify(error='Account not approved'),403
+            session.clear()
+            return jsonify(error='Account not approved'), 403
         session['role'] = user[0]['role']
-        return fn(*a,**kw)
+        return fn(*args, **kwargs)
     return inner
 
-def admin(): return session.get('role') == 'admin'
+def admin():
+    return session.get('role') == 'admin'
 
 @app.get('/')
-def home(): return send_from_directory(BASE,'index.html')
+def home():
+    return send_from_directory(BASE, 'index.html')
+
 @app.get('/manifest.json')
-def manifest(): return send_from_directory(BASE,'manifest.json')
+def manifest():
+    return send_from_directory(BASE, 'manifest.json')
+
 @app.get('/sw.js')
-def sw(): return send_from_directory(BASE,'sw.js')
+def sw():
+    return send_from_directory(BASE, 'sw.js')
 
 @app.post('/api/register')
 def register():
-    d=request.get_json(silent=True) or {}
-    name=str(d.get('name','')).strip()[:150]
-    username=str(d.get('username','')).strip().lower()
-    pw=str(d.get('password',''))
-    if not name or not (3<=len(username)<=80) or not (12<=len(pw)<=256):
-        return jsonify(error='Name, username (3-80) and password (12+ characters) required'),400
+    d = request.get_json(silent=True) or {}
+    name = str(d.get('name','')).strip()[:150]
+    username = str(d.get('username','')).strip().lower()
+    pw = str(d.get('password',''))
+    # Minimum 6 characters for every account, including admin and employees.
+    if not name or not (3 <= len(username) <= 80) or not (6 <= len(pw) <= 256):
+        return jsonify(error='Name, username (3-80) and password (minimum 6 characters) required'), 400
     try:
         with db() as conn:
-            # Serializes the first-admin election even when requests arrive together.
             conn.execute('SELECT pg_advisory_xact_lock(473813)')
-            first=conn.execute('SELECT NOT EXISTS(SELECT 1 FROM users) AS first').fetchone()['first']
+            first = conn.execute('SELECT NOT EXISTS(SELECT 1 FROM users) AS first').fetchone()['first']
             if first:
-                submitted_token = str(d.get('admin_token', ''))
-                if len(ADMIN_SETUP_TOKEN) < 32 or not secrets.compare_digest(submitted_token, ADMIN_SETUP_TOKEN):
+                token = str(d.get('admin_token', ''))
+                if len(ADMIN_SETUP_TOKEN) < 32 or not secrets.compare_digest(token, ADMIN_SETUP_TOKEN):
                     return jsonify(error='First admin setup token is missing or incorrect'), 403
             conn.execute('INSERT INTO users(name,username,password,role,approved) VALUES(%s,%s,%s,%s,%s)',
-                         (name,username,generate_password_hash(pw),'admin' if first else 'user',1 if first else 0))
+                         (name, username, generate_password_hash(pw), 'admin' if first else 'user', 1 if first else 0))
     except UniqueViolation:
-        return jsonify(error='Username already exists'),409
-    return jsonify(message='Admin activated' if first else 'Waiting for admin approval',approved=first)
+        return jsonify(error='Username already exists'), 409
+    return jsonify(message='Admin activated' if first else 'Waiting for admin approval', approved=first)
 
 @app.post('/api/login')
 def login():
-    d=request.get_json(silent=True) or {}
-    username=str(d.get('username','')).strip().lower()[:80]
-    password=str(d.get('password',''))
-    now=time.time()
+    d = request.get_json(silent=True) or {}
+    username = str(d.get('username','')).strip().lower()[:80]
+    password = str(d.get('password',''))
+    now = time.time()
     with db() as conn:
-        conn.execute('INSERT INTO login_attempts(username) VALUES(%s) ON CONFLICT DO NOTHING',(username,))
-        attempt=conn.execute('SELECT attempts,blocked_until FROM login_attempts WHERE username=%s FOR UPDATE',(username,)).fetchone()
-        if attempt['blocked_until'] > now: return jsonify(error='Too many attempts; try again later'),429
-        u=conn.execute('SELECT * FROM users WHERE username=%s',(username,)).fetchone()
-        if not u or not check_password_hash(u['password'],password):
-            n=attempt['attempts']+1
+        conn.execute('INSERT INTO login_attempts(username) VALUES(%s) ON CONFLICT DO NOTHING', (username,))
+        attempt = conn.execute('SELECT attempts,blocked_until FROM login_attempts WHERE username=%s FOR UPDATE', (username,)).fetchone()
+        if attempt['blocked_until'] > now:
+            return jsonify(error='Too many attempts; try again later'), 429
+        user = conn.execute('SELECT * FROM users WHERE username=%s', (username,)).fetchone()
+        if not user or not check_password_hash(user['password'], password):
+            n = attempt['attempts'] + 1
             conn.execute('UPDATE login_attempts SET attempts=%s,blocked_until=%s WHERE username=%s',
-                         (n,now+900 if n>=5 else 0,username))
-            return jsonify(error='Incorrect login'),401
-        conn.execute('UPDATE login_attempts SET attempts=0,blocked_until=0 WHERE username=%s',(username,))
-    if not u['approved']: return jsonify(error='Waiting for admin approval'),403
-    session.clear();session.permanent=True
-    session.update(uid=u['id'],role=u['role'],name=u['name'])
-    return jsonify(name=u['name'],role=u['role'])
+                         (n, now+900 if n >= 5 else 0, username))
+            return jsonify(error='Incorrect login'), 401
+        conn.execute('UPDATE login_attempts SET attempts=0,blocked_until=0 WHERE username=%s', (username,))
+    if not user['approved']:
+        return jsonify(error='Waiting for admin approval'), 403
+    session.clear()
+    session.permanent = True
+    session.update(uid=user['id'], role=user['role'], name=user['name'])
+    return jsonify(name=user['name'], role=user['role'])
 
 @app.post('/api/logout')
-def logout(): session.clear();return jsonify(ok=True)
+def logout():
+    session.clear()
+    return jsonify(ok=True)
+
 @app.get('/api/me')
-def me(): return jsonify(name=session.get('name'),role=session.get('role'))
+def me():
+    return jsonify(name=session.get('name'), role=session.get('role'))
+
 @app.get('/api/data')
 @auth
 def data():
     return jsonify(vendors=query('SELECT * FROM vendors ORDER BY name'),
                    payments=query('SELECT * FROM payments ORDER BY year DESC,month DESC'),
-                   banks=query('SELECT * FROM banks ORDER BY name'),heads=query('SELECT * FROM heads ORDER BY name'),
+                   banks=query('SELECT * FROM banks ORDER BY name'),
+                   heads=query('SELECT * FROM heads ORDER BY name'),
                    settings=query('SELECT * FROM settings'),
                    users=query('SELECT id,name,username,role,approved FROM users ORDER BY id') if admin() else [])
 
 @app.post('/api/save/<kind>')
 @auth
 def save(kind):
-    d=request.get_json(silent=True) or {}
-    tables={'vendors':['name','holder','account','routing','branch','bank','mobile','head'],
-            'payments':['vendor_id','year','month','amount','head'],
-            'banks':['name'],'heads':['name'],'settings':['key','value']}
-    if kind not in tables:return jsonify(error='Invalid section'),400
-    if kind=='settings' and not admin():return jsonify(error='Admin only'),403
-    fields=tables[kind];vals=[d.get(k,'') for k in fields]
-    if kind=='payments':
+    d = request.get_json(silent=True) or {}
+    tables = {'vendors':['name','holder','account','routing','branch','bank','mobile','head'],
+              'payments':['vendor_id','year','month','amount','head'],
+              'banks':['name'], 'heads':['name'], 'settings':['key','value']}
+    if kind not in tables:
+        return jsonify(error='Invalid section'), 400
+    if kind == 'settings' and not admin():
+        return jsonify(error='Admin only'), 403
+    fields = tables[kind]
+    vals = [d.get(k,'') for k in fields]
+    if kind == 'payments':
         try:
-            vals[0]=int(vals[0]);vals[1]=int(vals[1]);vals[2]=int(vals[2]);vals[3]=float(vals[3])
-            if not (2000<=vals[1]<=2200 and 1<=vals[2]<=12 and math.isfinite(vals[3]) and vals[3]>=0):raise ValueError()
-        except (TypeError,ValueError):return jsonify(error='Invalid payment values'),400
-    if kind in ('banks','heads','vendors') and not str(vals[0]).strip():return jsonify(error='Name required'),400
-    if kind=='settings' and str(vals[0]) not in ('organization','address'):
-        return jsonify(error='Invalid setting key'),400
-    if any(isinstance(v,str) and len(v)>2000 for v in vals):return jsonify(error='Field too long'),400
+            vals[0], vals[1], vals[2], vals[3] = int(vals[0]), int(vals[1]), int(vals[2]), float(vals[3])
+            if not (2000 <= vals[1] <= 2200 and 1 <= vals[2] <= 12 and math.isfinite(vals[3]) and vals[3] >= 0):
+                raise ValueError()
+        except (TypeError, ValueError):
+            return jsonify(error='Invalid payment values'), 400
+    if kind in ('banks','heads','vendors') and not str(vals[0]).strip():
+        return jsonify(error='Name required'), 400
+    if kind == 'settings' and str(vals[0]) not in ('organization','address'):
+        return jsonify(error='Invalid setting key'), 400
+    if any(isinstance(v, str) and len(v) > 2000 for v in vals):
+        return jsonify(error='Field too long'), 400
     try:
         with db() as conn:
-            if kind=='settings':
-                conn.execute('INSERT INTO settings(key,value) VALUES(%s,%s) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value',vals)
+            if kind == 'settings':
+                conn.execute('INSERT INTO settings(key,value) VALUES(%s,%s) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value', vals)
             elif d.get('id'):
-                rid=int(d['id'])
-                conn.execute(f'UPDATE {kind} SET '+','.join(f'{k}=%s' for k in fields)+' WHERE id=%s',vals+[rid])
+                rid = int(d['id'])
+                conn.execute(f'UPDATE {kind} SET ' + ','.join(f'{k}=%s' for k in fields) + ' WHERE id=%s', vals+[rid])
             else:
-                conn.execute(f'INSERT INTO {kind}('+','.join(fields)+') VALUES('+','.join('%s' for _ in fields)+')',vals)
-    except (UniqueViolation,ForeignKeyViolation):return jsonify(error='Duplicate or invalid record'),409
-    except (ValueError,TypeError):return jsonify(error='Invalid record ID'),400
+                conn.execute(f'INSERT INTO {kind}(' + ','.join(fields) + ') VALUES(' + ','.join('%s' for _ in fields) + ')', vals)
+    except (UniqueViolation, ForeignKeyViolation):
+        return jsonify(error='Duplicate or invalid record'), 409
+    except (ValueError, TypeError):
+        return jsonify(error='Invalid record ID'), 400
     return jsonify(ok=True)
 
 @app.post('/api/delete/<kind>/<int:id>')
 @auth
-def delete(kind,id):
-    if kind not in ('vendors','payments','banks','heads'):return jsonify(error='Invalid section'),400
-    if kind=='vendors' and query('SELECT 1 FROM payments WHERE vendor_id=%s LIMIT 1',(id,)):
-        return jsonify(error='Vendor has payment history; keep it for records'),409
-    try:execute(f'DELETE FROM {kind} WHERE id=%s',(id,))
-    except ForeignKeyViolation:return jsonify(error='Record is referenced'),409
+def delete(kind, id):
+    if kind not in ('vendors','payments','banks','heads'):
+        return jsonify(error='Invalid section'), 400
+    if kind == 'vendors' and query('SELECT 1 FROM payments WHERE vendor_id=%s LIMIT 1', (id,)):
+        return jsonify(error='Vendor has payment history; keep it for records'), 409
+    try:
+        execute(f'DELETE FROM {kind} WHERE id=%s', (id,))
+    except ForeignKeyViolation:
+        return jsonify(error='Record is referenced'), 409
     return jsonify(ok=True)
 
 @app.post('/api/approve/<int:id>')
 @auth
 def approve(id):
-    if not admin():return jsonify(error='Admin only'),403
-    execute('UPDATE users SET approved=1 WHERE id=%s AND role<>%s',(id,'admin'))
+    if not admin():
+        return jsonify(error='Admin only'), 403
+    execute('UPDATE users SET approved=1 WHERE id=%s AND role<>%s', (id, 'admin'))
     return jsonify(ok=True)
 
-# Initialize once per process; safe across concurrent Render workers.
 init()
-if __name__=='__main__':
-    app.run(host='0.0.0.0',port=int(os.environ.get('PORT',5000)),debug=False)
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)), debug=False)
