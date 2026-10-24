@@ -12,8 +12,8 @@ app = Flask(__name__, static_folder='static', static_url_path='/static')
 SECRET = os.environ.get('SECRET_KEY', '')
 DATABASE_URL = os.environ.get('DATABASE_URL', '')
 ADMIN_SETUP_TOKEN = os.environ.get('ADMIN_SETUP_TOKEN', '')
-if len(SECRET) < 32 or not DATABASE_URL:
-    raise RuntimeError('Set DATABASE_URL and a random SECRET_KEY of at least 32 characters in Render environment variables')
+if len(SECRET) < 6 or not DATABASE_URL:
+    raise RuntimeError('Set DATABASE_URL and a SECRET_KEY of at least 6 characters in Render environment variables')
 app.secret_key = SECRET
 app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE='Lax',
                   SESSION_COOKIE_SECURE=True, PERMANENT_SESSION_LIFETIME=timedelta(hours=8),
